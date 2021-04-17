@@ -7,6 +7,7 @@ using ModelingToolkit
 using DataDrivenDiffEq
 using LinearAlgebra, DiffEqSensitivity, Optim
 using DiffEqFlux, Flux
+using DataInterpolations
 using Plots
 gr()
 using JLD2, FileIO
@@ -60,9 +61,7 @@ for i in 1:length(ty)-1
     YS[i, :] = [Xₙ[2, t .== ty[i]]'; Xₙ[2, t .== ty[i+1]]]
 end
 
-XS
 
-scatter!(t, transpose(Xₙ))
 ## Define the network
 # Gaussian RBF as activation
 rbf(x) = exp.(-(x.^2))
@@ -131,7 +130,7 @@ end
 res1 = DiffEqFlux.sciml_train(loss, p, ADAM(0.1f0), cb=callback, maxiters = 200)
 println("Training loss after $(length(losses)) iterations: $(losses[end])")
 # Train with BFGS
-res2 = DiffEqFlux.sciml_train(loss, res1.minimizer, BFGS(initial_stepnorm=0.01f0), cb=callback, maxiters = 10000)
+res2 = DiffEqFlux.sciml_train(loss, res1.minimizer, BFGS(initial_stepnorm=0.1f0), cb=callback, maxiters = 10000)
 println("Final training loss after $(length(losses)) iterations: $(losses[end])")
 
 # Plot the losses
@@ -146,7 +145,8 @@ p_trained = res2.minimizer
 # Plot the data and the approximation
 X̂ = predict(p_trained)
 # Trained on noisy data vs real solution
-pl_trajectory = plot(t, transpose(X̂), ylabel = "t", xlabel ="x(t), y(t)", color = :red, label = ["UDE Approximation" nothing])
+pl_trajectory = plot(t, transpose(X̂), ylabel = "t", xlabel ="x(t), y(t)", color = :red, label = ["UDE Approximation" nothing],
+    legend = :topleft)
 scatter!(t, X[1,:], color = :black, label = "Measurements")
 ymeasurements = unique!(vcat(YS...))
 tmeasurements = unique!(vcat([[ts[1], ts[end]] for ts in eachrow(TS)]...))
@@ -242,7 +242,7 @@ true_solution_long = solve(true_prob, Tsit5(), saveat = estimate_long.t)
 plot!(true_solution_long)
 
 ## Save the results
-save(joinpath(pwd(), "results" ,"$(svname)recovery_$(noise_magnitude).jld2"),
+JLD2.save(joinpath(pwd(), "results" ,"$(svname)recovery_$(noise_magnitude).jld2"),
     "solution", solution, "X", Xₙ, "t" , t, "neural_network" , U, "initial_parameters", p, "trained_parameters" , p_trained, # Training
     "losses", losses, "result", Ψf, "recovered_parameters", p̂, # Recovery
     "long_solution", true_solution_long, "long_estimate", estimate_long) # Estimation
@@ -285,3 +285,85 @@ l = @layout [grid(1,2)
 plot(p1,p2,p3,layout = l)
 
 savefig(joinpath(pwd(),"plots","$(svname)full_plot.pdf"))
+
+## Try SINDy directly on interpolation
+ys = unique!(vcat(YS...))
+dy = solution(t, Val{1})[2,:]
+
+# Try different interpolation
+itp_li = LinearInterpolation(ys, ty)
+itp_cs = CubicSpline(ys, ty)
+itp_qs = QuadraticSpline(ys, ty)
+itp_pl = LagrangeInterpolation(ys, ty, 5)
+
+y_li = itp_li.(t)
+y_cs = itp_cs.(t)
+y_qs = itp_qs.(t)
+y_pl = itp_pl.(t)
+
+dy_li = DataInterpolations.derivative.((itp_li,), t)
+dy_cs = DataInterpolations.derivative.((itp_cs,), t)
+dy_qs = DataInterpolations.derivative.((itp_qs,), t)
+dy_pl = DataInterpolations.derivative.((itp_pl,), t)
+
+# Estiates
+p_yitp = scatter(solution, vars = (0,2), legend = :topleft, xlabel = "t", ylabel = "y", label = "True Measurements")
+plot!(t, y_li, label = "Linear")
+plot!(t, y_cs, label = "Cubic Spline ")
+plot!(t, y_qs, label = "Quadratic Spline ")
+plot!(t, y_pl, label = "Polynomial ")
+# Derivates
+p_dyitp = scatter(t, dy, label = nothing, xlabel = "t", ylabel = "dy", legend = :topleft)
+plot!(t, dy_li, label = nothing)
+plot!(t, dy_cs, label = nothing)
+plot!(t, dy_qs, label = nothing)
+plot!(t, dy_pl, label = nothing)
+
+plot(p_yitp, p_dyitp, layout = (1,2))
+savefig(joinpath(pwd(),"plots","$(svname)interpolations_plot.pdf"))
+
+# Create a Basis
+@variables u[1:2]
+
+# Generate the basis functions, multivariate polynomials up to deg 5
+# and sine
+b = [polynomial_basis(u, 5); sin.(u)]
+basis = Basis(b, u)
+
+# Create an optimizer for the SINDy problem
+opt = SR3(Float32(1e-2), Float32(1e-2))
+# Create the thresholds which should be used in the search process
+λ = Float32.(exp10.(-7:0.1:3))
+# Target function to choose the results from; x = L0 of coefficients and L2-Error of the model
+g(x) = x[1] < 1 ? Inf : norm(x, 2)
+
+# Test on ideal derivative data for unknown function ( not available )
+println("SINDy on partial interpolated data")
+using Latexify
+@variables x y
+Latexify.copy_to_clipboard(true)
+X_itp = vcat(Xₙ[1,:]', y_li')
+Ψ = SINDy(X_itp, dy_li , basis, λ, opt, g = g, maxiter = 10000) # Fails
+println(Ψ)
+latexify(Ψ(u, round.(parameters(Ψ), digits = 2)))
+
+
+
+X_itp = vcat(Xₙ[1,:]', y_qs')
+Ψ = SINDy(X_itp, dy_qs , basis, λ, opt, g = g, maxiter = 10000) # Fails
+println(Ψ)
+Ψ(u, )
+print_equations(Ψ, show_parameter = false)
+round.(parameters(Ψ), digits = 2)
+
+
+X_itp = vcat(Xₙ[1,:]', y_cs')
+Ψ = SINDy(X_itp, dy_cs , basis, λ, opt, g = g, maxiter = 10000) # Fails
+println(Ψ)
+print_equations(Ψ, show_parameter = false)
+round.(parameters(Ψ), digits = 2)
+
+X_itp = vcat(Xₙ[1,:]', y_pl')
+Ψ = SINDy(X_itp, dy_pl, basis, λ, opt, g = g, maxiter = 10000) # Fails
+println(Ψ)
+print_equations(Ψ)
